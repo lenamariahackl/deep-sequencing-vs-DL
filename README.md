@@ -6,7 +6,7 @@ This repository contains code to reproduce the results for the publication "Dete
 
 The study addresses the question: Can we utilize the vast repository of publicly available RNA-seq data for AS detection, despite often lacking the sequencing depth typically required? We show that sequence-based tools such as DeepSplice and SpliceAI show promising performance in retrieving novel and unannotated splice junctions, even when RNA-seq data are limited, but are not suitable for de novo splice junction detection. Our results demonstrate the potential of sequence-based tools for initial hypothesis development and as additional filters in standard RNA-seq pipelines, especially when sequencing depth is limited. Nonetheless, validation with higher sequencing depths remains essential for confirmation of splice events.
 
-## Pipeline to redproduce results
+## Pipeline to reproduce results
 
 Download all data from https://doi.org/10.5281/zenodo.16843445 and unpack into a data folder in the same directory.
 
