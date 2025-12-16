@@ -2,9 +2,11 @@ import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
 import os
 import numpy as np
-from sklearn.metrics import average_precision_score,f1_score
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, confusion_matrix
 import math
 import pickle as pkl
+from itertools import combinations
+import csv
 import logging
 logger = logging.getLogger('main')
 logger.setLevel(logging.INFO)
@@ -47,19 +49,18 @@ def get_predictions(tool, junction_type, input_aligner=''):
 		logger.error(f"{tool} can't be run on {input_aligner} {junction_type} data.")
 		exit()
 	pred_sjs = {}
-	add_type = '_max' if tool in ['spliceai','jcc'] else ''
 	if junction_type in ['50M','500M']:
 		for sample_id in samples:
 			iterations = (['_'+str(i) for i in range(10)] if junction_type=='50M' else [''])
 			for i in iterations:
 				if tool in ['deepsplice','spliceai','jcc']:
-					pred_sj = pd.read_csv(f'{pred_dir}/{junction_type}/{sample_id}/{input_aligner}/{tool}_pred{add_type}{i}.csv', dtype={'chr':'object'})
+					pred_sj = pd.read_csv(f'{pred_dir}/{junction_type}/{sample_id}/{input_aligner}/{tool}_pred{i}.csv', dtype={'chr':'object'})
 				else:
 					logger.error(f"Tool {tool} not supported.")
 				pred_sjs[(tool, sample_id, i[1:])] = pred_sj[pred_sj.chr.isin(chromosomes) & pred_sj.strand.isin([1,2])]
 	else:
 		if junction_type in ['negatives','annotated']:
-			pred_sj = pd.read_csv(f'{pred_dir}/{junction_type}/{tool}_pred{add_type}.csv', dtype={'chr':'object'})
+			pred_sj = pd.read_csv(f'{pred_dir}/{junction_type}/{tool}_pred.csv', dtype={'chr':'object'})
 			pred_sjs = pred_sj[pred_sj.chr.isin(chromosomes) & pred_sj.strand.isin([1,2])].drop_duplicates()
 	return pred_sjs
 
@@ -189,6 +190,104 @@ def calc_auprc(sjs, score_dir, aligner, gt_confidence):
 		file.write(f'{aligner},{gt_confidence},{tool},{math.floor(np.mean(nr_positives))},{math.floor(np.std(nr_positives))},{math.floor(np.mean(nr_negatives))},{math.floor(np.std(nr_negatives))}\n')
 
 
+# save effectsize in file 
+def write_effectsize_ci(tool_sjs, stats_dir, aligner, gt_confidence, n_bootstrap=1000):
+    TOOL_PLOT_NAME = {
+        'spliceai': 'SpliceAI',
+        'deepsplice': 'DeepSplice',
+        'jcc': 'JCC',
+        'baseline': 'No-Skill'
+    }
+    # Tools to use (excluding baseline)
+    tool_names = [key for key in TOOL_PLOT_NAME if key in tool_sjs]
+
+    # Precompute bootstrap indices for every sample/run
+    bootstrap_indices = {}
+    lens = {}
+    for (_, sample, run_id), s in tool_sjs[tool_names[0]].items():
+        n = s.shape[0]
+        bootstrap_indices[(sample, run_id)] = np.random.randint(0, n, size=(n_bootstrap, n))
+        lens[(sample, run_id)] = n
+
+    # Precompute per-tool per-(sample,run) AUPRCs for each bootstrap
+    per_tool_auprcs = {t: {} for t in tool_names}
+    for t in tool_names:
+        for (_, sample, run_id), s in tool_sjs[t].items():
+            indices = bootstrap_indices[(sample, run_id)]
+            labels = s['label'].values
+            preds = s['pred'].values
+            boot_auprcs = np.array([
+                average_precision_score(labels[idx], preds[idx]) for idx in indices
+            ])
+            per_tool_auprcs[t][(sample, run_id)] = boot_auprcs
+
+    # Precompute baseline auprcs:
+    per_baseline_auprcs = {}
+    for (_, sample, run_id), s in tool_sjs[tool_names[0]].items():
+        indices = bootstrap_indices[(sample, run_id)]
+        labels = s['label'].values
+        n = len(labels)
+        # Baseline: predict all 1's
+        preds_baseline = np.ones_like(labels)
+        boot_auprcs = np.array([
+            average_precision_score(labels[idx], preds_baseline[idx]) for idx in indices
+        ])
+        per_baseline_auprcs[(sample, run_id)] = boot_auprcs
+
+    results_rows = []
+
+    # Compare each tool to baseline
+    for t in tool_names:
+        t_name = TOOL_PLOT_NAME[t]
+        for (sample, run_id) in per_tool_auprcs[t]:
+            tool_auprcs = per_tool_auprcs[t][(sample, run_id)]
+            baseline_auprcs = per_baseline_auprcs[(sample, run_id)]
+            bootstrapped_deltas = tool_auprcs - baseline_auprcs
+            mean_delta = np.mean(bootstrapped_deltas)
+            ci_lower, ci_upper = np.percentile(bootstrapped_deltas, [2.5, 97.5])
+            row = [aligner, gt_confidence, sample, run_id, t_name, TOOL_PLOT_NAME['baseline'], mean_delta, ci_lower, ci_upper]
+            results_rows.append(row)
+
+    # Compare all pairs of tools (excluding baseline)
+    for t1, t2 in combinations(tool_names, 2):
+        n1 = TOOL_PLOT_NAME[t1]
+        n2 = TOOL_PLOT_NAME[t2]
+        for (sample, run_id) in per_tool_auprcs[t1]:
+            auprc1 = per_tool_auprcs[t1][(sample, run_id)]
+            auprc2 = per_tool_auprcs[t2][(sample, run_id)]
+            bootstrapped_deltas = auprc1 - auprc2
+            mean_delta = np.mean(bootstrapped_deltas)
+            ci_lower, ci_upper = np.percentile(bootstrapped_deltas, [2.5, 97.5])
+            row = [aligner, gt_confidence, sample, run_id, n1, n2, mean_delta, ci_lower, ci_upper]
+            results_rows.append(row)
+
+    # Write to CSV
+    csv_file_path = f'{stats_dir}/effect_sizes.csv'
+    write_header = not os.path.exists(csv_file_path) or os.stat(csv_file_path).st_size == 0
+    with open(csv_file_path, mode='a', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        if write_header:
+            headers = ['aligner', 'gt_confidence', 'sample', 'run_id', 'tool1', 'tool2', 'mean_delta', 'ci_lower', 'ci_upper']
+            writer.writerow(headers)
+        writer.writerows(results_rows)
+
+
+def write_operating_points(y_true, y_scores, stats_dir, tool, aligner, gt_confidence):
+	# At fixed thresholds
+	thresholds = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+	summary_file = f"{stats_dir}/operating_points.csv"
+	if (not os.path.isfile(summary_file)):
+		with open(summary_file, 'w') as file:
+			file.write(f'tool,aligner,gt_confidence,threshold,precision,recall,TP,FP,FN,TN\n')
+	with open(summary_file, 'a') as f:
+		for threshold in thresholds:
+			pred_at_thresh = (y_scores >= threshold).astype(int)
+			precision_fixed = precision_score(y_true, pred_at_thresh, zero_division=0)
+			recall_fixed = recall_score(y_true, pred_at_thresh, zero_division=0)
+			tn, fp, fn, tp = confusion_matrix(y_true, pred_at_thresh).ravel()
+			f.write(f"{tool},{aligner},{gt_confidence},{threshold},{precision_fixed},{recall_fixed},{tp},{fp},{fn},{tn}\n")
+
+
 # calculate performance for Scenario 1b: "Detecting spurious junctions"
 def scenario_1b(aligner, gt_confidence, stats_dir, file_sj_50):
 	os.makedirs(stats_dir, exist_ok=True)
@@ -231,10 +330,14 @@ def scenario_1b(aligner, gt_confidence, stats_dir, file_sj_50):
 		with open(file_sj_50, 'wb') as f:
 			pkl.dump(tool_sjs_50, f)
 	for tool, sjs in tool_sjs_50.items():
+		all_labels = np.concatenate([sj["label"] for sj in sjs.values()]) # append all samples
+		all_preds = np.concatenate([sj["pred"] for sj in sjs.values()]) # append all samples
+		write_operating_points(all_labels, all_preds, stats_dir, tool, aligner, gt_confidence)
 		calc_auprc(sjs, stats_dir, aligner, gt_confidence)
 		for threshold in np.arange(0, 1.1, 0.1):
 			calc_f1_score_at_threshold(sjs, stats_dir, aligner, gt_confidence, threshold=threshold)
 	calc_no_skill_auprc(tool_sjs_50, stats_dir, aligner, gt_confidence)
+	write_effectsize_ci(tool_sjs_50, stats_dir, aligner, gt_confidence)
 	return tool_sjs_50
 
 
@@ -275,10 +378,14 @@ def scenario_1a(aligner, gt_confidence, stats_dir, file_sj_50_neg, tool_sjs_50):
 		with open(file_sj_50_neg, 'wb') as f:
 			pkl.dump(tool_sjs_50_neg, f)
 	for tool, sjs in tool_sjs_50_neg.items():
+		all_labels = np.concatenate([sj["label"] for sj in sjs.values()]) # append all samples
+		all_preds = np.concatenate([sj["pred"] for sj in sjs.values()]) # append all samples
+		write_operating_points(all_labels, all_preds, stats_dir, tool, aligner, gt_confidence)
 		calc_auprc(sjs, stats_dir, aligner, gt_confidence)
 		for threshold in np.arange(0, 1.1, 0.1):
 			calc_f1_score_at_threshold(sjs, stats_dir, aligner, gt_confidence, threshold=threshold)
 	calc_no_skill_auprc(tool_sjs_50_neg, stats_dir, aligner, gt_confidence)
+	write_effectsize_ci(tool_sjs_50_neg, stats_dir, aligner, gt_confidence)
 
 
 # calculate performance for Scenario 2: "Predicting junctions that could be detected with higher sequencing depth" / Scenario 3: "Predicting hard-to-find junctions"
@@ -326,22 +433,25 @@ def scenario_2_3(aligner, gt_confidence, stats_dir, scenario, hard_to_find, file
 				sjs_50[pred_ann] = merged_sj # pred_ann [(tool, sample_id, i)]
 			tool_sjs_50[tool] = sjs_50
 		if scenario == 'hypothetical':
-			tool_sjs_50 = scenario_2_3_add_negatives(scenario, tool_sjs_50)
+			tool_sjs_50 = scenario_2_3_add_negatives(tools, tool_sjs_50)
 		with open(file_sj_50, 'wb') as f:
 			pkl.dump(tool_sjs_50, f)
 	for tool, sjs in tool_sjs_50.items():
+		all_labels = np.concatenate([sj["label"] for sj in sjs.values()]) # append all samples
+		all_preds = np.concatenate([sj["pred"] for sj in sjs.values()]) # append all samples
+		write_operating_points(all_labels, all_preds, stats_dir, tool, aligner, gt_confidence)
 		calc_auprc(sjs, stats_dir, aligner, gt_confidence)
 		for threshold in np.arange(0, 1.1, 0.1):
 			calc_f1_score_at_threshold(sjs, stats_dir, aligner, gt_confidence, threshold=threshold)
 	calc_no_skill_auprc(tool_sjs_50, stats_dir, aligner, gt_confidence)
+	write_effectsize_ci(tool_sjs_50, stats_dir, aligner, gt_confidence)
 
 
 # for Hypothetical setting we add negative junctions for evaluation
-def scenario_2_3_add_negatives(scenario, tool_sjs_50):
+def scenario_2_3_add_negatives(tools, tool_sjs_50):
 	# add same amount negatives 
 	true_sjs_neg = get_gold_standard('negatives') # empty DataFrame
 	tool_sjs_50_neg = {}
-	tools = ['deepsplice','spliceai'] if scenario == 'hypothetical' else []
 	for tool in tools:
 		pred_sjs_neg = get_predictions(tool, 'negatives')
 		sjs_neg = pred_sjs_neg.merge(true_sjs_neg, on=['chr', 'start', 'end', 'strand'], how='outer') # predictions negatives + true negatives
