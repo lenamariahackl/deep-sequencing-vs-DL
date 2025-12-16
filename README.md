@@ -14,5 +14,4 @@ Create the conda environment using the yml file provided: conda env create -f ev
 
 To get stats on the performance on the different evaluation scenarios, run python evaluation_scenarios.py
 To reproduce the plots from the paper, run plots.ipynb.
-
-
+To reproduce AlphaGenome results, run alphagenome.ipynb.
