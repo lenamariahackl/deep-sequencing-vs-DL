@@ -8,7 +8,7 @@ The study addresses the question: Can we utilize the vast repository of publicly
 
 ## Pipeline to reproduce results
 
-Download all data from https://doi.org/10.5281/zenodo.16843445 and unpack into a data folder in the same directory.
+Download all data from [https://zenodo.org/records/17952954](https://zenodo.org/records/17952954) and unpack into a data folder in the same directory.
 
 Create the conda environment using the yml file provided: conda env create -f eval.yml
 
